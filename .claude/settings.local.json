@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./venv/bin/yt-dlp --no-warnings -o \"/tmp/test_clip.%\\(ext\\)s\" \"https://www.twitch.tv/evelone2004/clip/EnticingBlightedFiddleheadsVoteNay-9q3yz5iujuAmQhpj\")",
+      "Read(//private/tmp/**)"
+    ]
+  }
+}
