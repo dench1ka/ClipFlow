@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import asyncio
@@ -7,8 +8,8 @@ from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from pyrogram import Client, filters
+from pyrogram.types import InputMediaDocument, Message
 import yt_dlp
 
 load_dotenv()
@@ -19,31 +20,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MAX_TG_BYTES = 50 * 1024 * 1024  # Telegram Bot API hard limit
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Quality ladder: try from best to worst until file fits
-QUALITY_LADDER = [
-    "best[format_id!*=portrait]",
-    "best[format_id!*=portrait][height<=720]",
-    "best[format_id!*=portrait][height<=480]",
-    "best[format_id!*=portrait][height<=360]",
-    "worst[format_id!*=portrait]/worst",
-]
+TG_MAX_BYTES = 2 * 1024 * 1024 * 1024        # Telegram hard limit
+PART_TARGET_BYTES = 1_900 * 1024 * 1024      # target per part (safety margin)
 
+TWITCH_VOD_PATTERN = re.compile(
+    r"https?://(?:www\.)?twitch\.tv/videos/(\d+)"
+)
 TWITCH_CLIP_PATTERN = re.compile(
-    r"https?://(?:www\.|clips\.)?twitch\.tv/(?:[^/]+/clip/|clip/)?([A-Za-z0-9_-]+)"
+    r"https?://(?:clips\.twitch\.tv/|(?:www\.)?twitch\.tv/[^/]+/clip/)([A-Za-z0-9_-]+)"
+)
+YOUTUBE_PATTERN = re.compile(
+    r"https?://(?:www\.|m\.)?(?:youtube\.com/watch\?(?:[^&\s]*&)*v=|youtu\.be/)([A-Za-z0-9_-]{11})"
 )
 
+QUALITY_LADDERS = {
+    "twitch_clip": [
+        "best[format_id!*=portrait]",
+        "worst[format_id!*=portrait]/worst",
+    ],
+    "twitch_vod": [
+        "best",
+        "worst",
+    ],
+    "youtube": [
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",
+        "worst",
+    ],
+}
 
-def is_twitch_clip(url: str) -> bool:
-    return bool(TWITCH_CLIP_PATTERN.search(url))
 
-
-def clean_url(url: str) -> str:
-    """Strip query params and fragments from Twitch clip URL."""
-    parsed = urlparse(url)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+def detect_url(text: str) -> tuple[str | None, str | None]:
+    if m := TWITCH_VOD_PATTERN.search(text):
+        return "twitch_vod", f"https://www.twitch.tv/videos/{m.group(1)}"
+    if TWITCH_CLIP_PATTERN.search(text):
+        parsed = urlparse(text)
+        clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        return "twitch_clip", clean
+    if m := YOUTUBE_PATTERN.search(text):
+        return "youtube", f"https://www.youtube.com/watch?v={m.group(1)}"
+    return None, None
 
 
 async def _run(func):
@@ -51,7 +72,7 @@ async def _run(func):
     return await loop.run_in_executor(None, func)
 
 
-async def get_clip_info(url: str) -> dict:
+async def get_info(url: str) -> dict:
     def _info():
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
             return ydl.extract_info(url, download=False)
@@ -59,10 +80,9 @@ async def get_clip_info(url: str) -> dict:
     return await _run(_info)
 
 
-async def download_clip(url: str, output_dir: str, fmt: str = "best") -> str:
-    """Download clip with given format string, return file path."""
+async def download_video(url: str, output_dir: str, fmt: str) -> str:
     ydl_opts = {
-        "outtmpl": os.path.join(output_dir, "clip.%(ext)s"),
+        "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
         "format": fmt,
         "quiet": True,
         "no_warnings": True,
@@ -81,79 +101,180 @@ async def download_clip(url: str, output_dir: str, fmt: str = "best") -> str:
 
 
 def find_file(directory: str) -> str | None:
-    """Find downloaded file in directory."""
-    for ext in ("mp4", "mkv", "webm", "mov"):
+    for ext in ("mp4", "mkv", "webm", "mov", "ts"):
         files = list(Path(directory).glob(f"*.{ext}"))
         if files:
             return str(files[0])
-    files = list(Path(directory).glob("*"))
+    files = [f for f in Path(directory).glob("*") if f.is_file()]
     return str(files[0]) if files else None
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Привет! Отправь мне ссылку на клип с Twitch.\n\n"
-        "Поддерживаемые форматы:\n"
-        "• https://clips.twitch.tv/ClipName\n"
-        "• https://www.twitch.tv/channel/clip/ClipName\n\n"
-        "Всегда пришлю видеофайл — если нужно, автоматически подберу качество."
+async def _probe_duration(filepath: str) -> float | None:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        filepath,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        return float(stdout.decode().strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+async def split_into_parts(filepath: str, tmpdir: str) -> list[str]:
+    """Split file into ~1.9 GB segments. Returns [filepath] if no split needed."""
+    file_size = os.path.getsize(filepath)
+    if file_size <= TG_MAX_BYTES:
+        return [filepath]
+
+    duration = await _probe_duration(filepath)
+    if not duration:
+        logger.warning("Cannot probe duration, skipping split")
+        return [filepath]
+
+    num_parts = math.ceil(file_size / PART_TARGET_BYTES)
+    seg_secs = math.ceil(duration / num_parts)
+
+    pattern = os.path.join(tmpdir, "part_%03d.mp4")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", filepath,
+        "-c", "copy", "-map", "0",
+        "-f", "segment",
+        "-segment_time", str(seg_secs),
+        "-reset_timestamps", "1",
+        pattern, "-y",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+    parts = sorted(Path(tmpdir).glob("part_*.mp4"))
+    if len(parts) < 2:
+        return [filepath]
+
+    logger.info("Split into %d parts (seg=%ds)", len(parts), seg_secs)
+    return [str(p) for p in parts]
+
+
+async def send_parts(
+    message: Message,
+    status_msg: Message,
+    parts: list[str],
+    title: str,
+    uploader: str,
+    duration_str: str,
+    quality_label: str | None,
+) -> None:
+    total = len(parts)
+    base_caption = f"<b>{title}</b>\n{uploader} • {duration_str}"
+    if quality_label:
+        base_caption += f"\nКачество: {quality_label}"
+
+    # Send in batches of 10 (Telegram media group limit)
+    for batch_start in range(0, total, 10):
+        batch = parts[batch_start : batch_start + 10]
+        batch_end = batch_start + len(batch)
+
+        await status_msg.edit_text(
+            f"Отправляю части {batch_start + 1}–{batch_end} из {total}...\n{title}"
+        )
+
+        media = []
+        for i, path in enumerate(batch):
+            part_num = batch_start + i + 1
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            if i == 0:
+                cap = f"{base_caption}\n\nЧасть {part_num} из {total} • {size_mb:.0f} MB"
+            else:
+                cap = f"Часть {part_num} из {total} • {size_mb:.0f} MB"
+            media.append(InputMediaDocument(media=path, caption=cap, parse_mode="html"))
+
+        await message.reply_media_group(media=media)
+
+
+def _fmt_duration(seconds) -> str:
+    if not seconds:
+        return "—"
+    h, m, s = int(seconds) // 3600, int(seconds) % 3600 // 60, int(seconds) % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_label(fmt: str) -> str:
+    for q in ("1080", "720", "480", "360"):
+        if q in fmt:
+            return f"{q}p"
+    if "worst" in fmt:
+        return "минимальное качество"
+    return "лучшее качество"
+
+
+app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+
+@app.on_message(filters.command("start"))
+async def start(_: Client, message: Message) -> None:
+    await message.reply_text(
+        "Привет! Отправь мне ссылку на видео.\n\n"
+        "Поддерживаемые платформы:\n"
+        "• Twitch клипы — clips.twitch.tv/...\n"
+        "• Twitch стримы (VOD) — twitch.tv/videos/...\n"
+        "• YouTube — youtube.com/watch?v=... или youtu.be/...\n\n"
+        "Если видео больше 2 GB — разобью на части и пришлю всё."
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
+@app.on_message(filters.text & ~filters.regex(r"^/"))
+async def handle_message(_: Client, message: Message) -> None:
+    text = message.text.strip()
+    platform, url = detect_url(text)
 
-    if not is_twitch_clip(text):
-        await update.message.reply_text(
-            "Это не похоже на ссылку на Twitch клип. Отправь ссылку вида:\n"
-            "https://clips.twitch.tv/..."
+    if not platform:
+        await message.reply_text(
+            "Это не похоже на поддерживаемую ссылку.\n\n"
+            "Поддерживаются:\n"
+            "• Twitch клипы: https://clips.twitch.tv/...\n"
+            "• Twitch стримы: https://twitch.tv/videos/...\n"
+            "• YouTube: https://youtube.com/watch?v=..."
         )
         return
 
-    status_msg = await update.message.reply_text("Получаю информацию о клипе...")
-
-    text = clean_url(text)
+    status_msg = await message.reply_text("Получаю информацию о видео...")
 
     try:
-        info = await get_clip_info(text)
+        info = await get_info(url)
     except Exception as e:
-        logger.error("Failed to fetch clip info: %s", e)
-        await status_msg.edit_text(f"Не удалось получить информацию о клипе:\n{e}")
+        logger.error("Failed to fetch info: %s", e)
+        await status_msg.edit_text(f"Не удалось получить информацию:\n{e}")
         return
 
     title = info.get("title", "Без названия")
     duration = info.get("duration", 0)
     uploader = info.get("uploader", "Неизвестно")
+    duration_str = _fmt_duration(duration)
 
-    # Pick dimensions from the best landscape format
-    vid_width, vid_height = 1920, 1080
-    for f in reversed(info.get("formats", [])):
-        if "portrait" not in f.get("format_id", "") and f.get("width") and f.get("height"):
-            vid_width, vid_height = f["width"], f["height"]
-            break
+    quality_ladder = QUALITY_LADDERS[platform]
 
-    for attempt, fmt in enumerate(QUALITY_LADDER):
-        quality_label = _fmt_label(fmt)
-
+    for attempt, fmt in enumerate(quality_ladder):
         if attempt == 0:
             await status_msg.edit_text(
-                f"Скачиваю клип...\n\n"
+                f"Скачиваю...\n\n"
                 f"Название: {title}\n"
                 f"Канал: {uploader}\n"
-                f"Длительность: {int(duration)} сек"
+                f"Длительность: {duration_str}"
             )
         else:
-            await status_msg.edit_text(
-                f"Файл не влезает в Telegram, пробую {quality_label}...\n\n"
-                f"{title}"
-            )
+            await status_msg.edit_text(f"Пробую {_fmt_label(fmt)}...\n\n{title}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             try:
-                filepath = await download_clip(text, tmpdir, fmt)
+                filepath = await download_video(url, tmpdir, fmt)
             except Exception as e:
                 logger.error("Download failed (fmt=%s): %s", fmt, e)
-                if attempt == len(QUALITY_LADDER) - 1:
+                if attempt == len(quality_ladder) - 1:
                     await status_msg.edit_text(f"Ошибка при скачивании:\n{e}")
                     return
                 continue
@@ -167,64 +288,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             file_size = os.path.getsize(filepath)
             size_mb = file_size / 1024 / 1024
+            quality_label = _fmt_label(fmt) if attempt > 0 else None
 
-            if file_size > MAX_TG_BYTES:
-                if attempt < len(QUALITY_LADDER) - 1:
-                    logger.info("File %.1fMB too large, trying lower quality", size_mb)
-                    continue
-                # Last resort — send whatever we have and warn user
+            # Split if file exceeds Telegram's 2 GB limit
+            if file_size > TG_MAX_BYTES:
                 await status_msg.edit_text(
-                    f"Даже на минимальном качестве файл {size_mb:.1f} MB.\n"
-                    f"Это очень необычно для Twitch клипа. Попробуй другой клип."
+                    f"Файл {size_mb:.0f} MB — разбиваю на части...\n{title}"
                 )
+                parts = await split_into_parts(filepath, tmpdir)
+            else:
+                parts = [filepath]
+
+            if len(parts) > 1:
+                try:
+                    await send_parts(
+                        message, status_msg, parts,
+                        title, uploader, duration_str, quality_label,
+                    )
+                    await status_msg.delete()
+                except Exception as e:
+                    logger.error("Failed to send parts: %s", e)
+                    await status_msg.edit_text(f"Ошибка при отправке частей:\n{e}")
                 return
 
-            caption = f"<b>{title}</b>\nКанал: {uploader}"
-            if attempt > 0:
+            # Single file upload with progress
+            caption = f"<b>{title}</b>\n{uploader} • {duration_str}"
+            if quality_label:
                 caption += f"\nКачество: {quality_label}"
 
-            await status_msg.edit_text("Отправляю видео...")
+            await status_msg.edit_text(f"Отправляю видео ({size_mb:.1f} MB)...")
+
+            last_step = [-1]
+
+            async def progress(current, total):
+                if not total:
+                    return
+                step = int(current / total * 10)
+                if step != last_step[0]:
+                    last_step[0] = step
+                    sent = current / 1024 / 1024
+                    try:
+                        await status_msg.edit_text(
+                            f"Отправляю... {step * 10}%\n{sent:.0f} / {size_mb:.0f} MB"
+                        )
+                    except Exception:
+                        pass
+
             try:
-                with open(filepath, "rb") as f:
-                    await update.message.reply_document(
-                        document=f,
-                        filename=f"{title}.mp4",
-                        caption=caption,
-                        parse_mode="HTML",
-                        read_timeout=180,
-                        write_timeout=180,
-                    )
+                await message.reply_document(
+                    document=filepath,
+                    caption=caption,
+                    parse_mode="html",
+                    progress=progress,
+                )
                 await status_msg.delete()
                 return
             except Exception as e:
                 logger.error("Failed to send video: %s", e)
-                await status_msg.edit_text(f"Ошибка при отправке видео:\n{e}")
+                await status_msg.edit_text(f"Ошибка при отправке:\n{e}")
                 return
 
 
-def _fmt_label(fmt: str) -> str:
-    if fmt == "best":
-        return "лучшее качество"
-    if "720" in fmt:
-        return "720p"
-    if "480" in fmt:
-        return "480p"
-    if "360" in fmt:
-        return "360p"
-    return "минимальное качество"
-
-
-def main() -> None:
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не задан в .env файле")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Бот запущен")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
 if __name__ == "__main__":
-    main()
+    missing = [v for v in ("API_ID", "API_HASH", "BOT_TOKEN") if not os.getenv(v)]
+    if missing:
+        raise ValueError(f"Не заданы в .env: {', '.join(missing)}")
+    app.run()
